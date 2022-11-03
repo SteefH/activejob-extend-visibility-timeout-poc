@@ -1,0 +1,7 @@
+delay: 2
+
+groups:
+  default:
+    concurrency: 2
+    queues:
+      - default

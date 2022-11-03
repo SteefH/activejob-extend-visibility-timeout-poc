@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -eo pipefail
+if [ -n "$DEBUG" ]; then set -x; fi
+
+function eecho() {
+	echo >&2 "$@"
+}
+
+script_dir=$(realpath "$(dirname "${BASH_SOURCE[0]}")")
+
+if ! command -v docker; then
+	eecho 'Docker should be installed to run this'
+	exit 1
+fi
+
+DOCKER_CONTAINER_NAME=shoryuken-extend-visibility-timeout
+
+run() {
+	cd "${script_dir}/.."
+	trap "cleanup" EXIT
+	start-localstack
+	sleep 3
+	setup-queues
+	eecho 'Start shoryuken'
+	bundle exec shoryuken --rails --queues default --delay 2 &
+	SHORYUKEN_PID=$!
+
+	sleep 3
+	send-message
+	wait "$SHORYUKEN_PID"
+}
+
+function start-localstack() {
+	eecho 'Starting localstack in the background'
+	docker run -d --rm -it --name "$DOCKER_CONTAINER_NAME" -p 4566:4566 -p 4510-4559:4510-4559 localstack/localstack >/dev/null
+}
+
+function setup-queues() (
+	eecho 'Setting up queues...'
+	eecho '...a dead letter queue'
+	bundle exec shoryuken sqs create DLQ --endpoint=http://localhost:4566
+	eecho '...and a default queue with a visibility timeout of 8s'
+	bundle exec shoryuken sqs create default --endpoint=http://localhost:4566 \
+		--attributes='VisibilityTimeout:8' 'RedrivePolicy:{"deadLetterTargetArn":"DLQ","maxReceiveCount":5}'
+)
+
+function send-message() {
+	eecho 'Send message'
+	bin/rails runner 'DelayedJob.perform_later(15)'
+}
+
+function stop-localstack() {
+	eecho "Stopping localstack"
+	docker stop "$DOCKER_CONTAINER_NAME" >/dev/null 2>&1
+	docker wait "$DOCKER_CONTAINER_NAME" >/dev/null 2>&1
+}
+
+function stop-shoryuken() {
+	[ -n "$SHORYUKEN_PID" ] || return
+	kill -TERM "$SHORYUKEN_PID" >/dev/null 2>&1
+	wait "$SHORYUKEN_PID"
+}
+
+function cleanup() {
+	stop-shoryuken
+	stop-localstack
+}
+
+run
